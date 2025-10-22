@@ -1,0 +1,108 @@
+---
+- name: Podman installation
+  when: not podman_only_users
+  block:
+    - name: Execute apt update if the last one is more than 1 hour ago
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_pkg_mgr == "apt"
+
+    - name: Install required packages
+      ansible.builtin.package:
+        name:
+          - acl # Needed by the "become_user" Ansible directive
+
+    - name: Install Podman
+      ansible.builtin.package:
+        name: podman
+
+    - name: Install podman-compose
+      ansible.builtin.package:
+        name: podman-compose
+      when: podman_compose
+
+- name: Set linger for podman_users
+  # Linger may need to be enabled before using systemctl as one of the
+  # podman_users. See https://access.redhat.com/discussions/6029491
+  vars:
+    podman_user_name: "{{ item.name }}"
+    set_linger: "{{ item.set_linger }}"
+  ansible.builtin.include_tasks: { file: sub-linger.yml }
+  when: item.set_linger is defined
+  loop: "{{ podman_users }}"
+
+- name: Podman basic configuration
+  when: not podman_only_users
+  block:
+    - name: Disable the podman-auto-update service at boot
+      ansible.builtin.systemd:
+        name: podman-auto-update.service
+        enabled: false
+
+    - name: Create the podman-auto-update user unit files if they don't exist
+      # Because they don't ship with Podman 3
+      ansible.builtin.copy:
+        src: /usr/lib/systemd/system/{{ item }}
+        dest: /usr/lib/systemd/user/{{ item }}
+        remote_src: true
+        force: false
+        mode: "0644"
+      loop: [podman-auto-update.service, podman-auto-update.timer]
+      register: pau_user_unit_files
+
+    - name: Issue systemctl --user daemon-reload to pick up config changes
+      become_user: "{{ item }}"
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      loop: "{{ podman_users | map(attribute='name') }}"
+      when: pau_user_unit_files is changed # noqa: no-handler
+
+- name: User scope - start the D-Bus socket
+  # To fix https://github.com/containers/podman/issues/12983 immediately, without rebooting
+  become_user: "{{ item }}"
+  ansible.builtin.systemd:
+    name: dbus.socket
+    scope: user
+    state: started
+  loop: "{{ podman_users | map(attribute='name') }}"
+
+- name: System scope - Podman socket configuration
+  ansible.builtin.include_tasks: { file: sub-socket.yml }
+  when: not podman_only_users
+
+- name: System scope - podman-auto-update configuration
+  ansible.builtin.include_tasks: { file: sub-pau.yml }
+  when: not podman_only_users
+
+- name: System scope - podman-kube@ extra args
+  ansible.builtin.include_tasks: { file: sub-pk-extra-args.yml }
+  when: not podman_only_users
+
+- name: User scope - Podman socket configuration
+  vars:
+    ansible_become_user: "{{ item.name }}"
+    podman_socket: "{{ item.socket | default(false) }}"
+  ansible.builtin.include_tasks: { file: sub-socket.yml }
+  loop: "{{ podman_users }}"
+
+- name: User scope - podman-auto-update configuration
+  vars:
+    ansible_become_user: "{{ item.name }}"
+    podman_auto_update_event_expr: "{{ item.auto_update_event_expr | default('') }}"
+  ansible.builtin.include_tasks: { file: sub-pau.yml }
+  loop: "{{ podman_users }}"
+
+- name: User scope - podman-kube@ extra args
+  vars:
+    ansible_become_user: "{{ item.name }}"
+    podman_kube_extra_args: "{{ item.kube_extra_args | default('') }}"
+  ansible.builtin.include_tasks: { file: sub-pk-extra-args.yml }
+  loop: "{{ podman_users }}"
+
+- name: Set lowest unprivileged port in sysctl
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_unprivileged_port_start
+    value: "{{ podman_ip_unprivileged_port_start | string }}"
+  when: not podman_only_users and podman_ip_unprivileged_port_start > 0
